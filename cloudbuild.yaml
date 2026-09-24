@@ -1,0 +1,69 @@
+steps:
+  # 1. Download official Alpine GCP base image
+  - name: 'gcr.io/cloud-builders/curl'
+    args:
+      - '-L'
+      - '-o'
+      - 'alpine-base.raw.tar.gz'
+      - 'https://dl-cdn.alpinelinux.org/alpine/v${_ALPINE_BRANCH}/releases/cloud/gcp_alpine-${_ALPINE_VERSION}-x86_64-uefi-tiny-r0.raw.tar.gz'
+
+  # 2. Extract, apply lite optimizations directly (dropbear, zram, cloud-lite, busybox udhcpc), and repack 
+  - name: 'gcr.io/cloud-builders/docker'
+    env:
+      - 'SSH_AUTHORIZED_KEY=${_SSH_AUTHORIZED_KEY}'
+    args:
+      - 'run'
+      - '--privileged'
+      - '-e'
+      - 'SSH_AUTHORIZED_KEY'
+      - '-v'
+      - '/workspace:/workspace'
+      - '-w'
+      - '/workspace'
+      - 'docker.io/library/alpine:${_ALPINE_BRANCH}'
+      - 'sh'
+      - '-c'
+      - |
+        apk add --no-cache tar gzip qemu-img parted e2fsprogs e2fsprogs-extra util-linux
+        chmod +x alpine-cloud-images-lite2/scripts/build-rootfs.sh alpine-cloud-images-lite2/scripts/setup-lite alpine-cloud-images-lite2/scripts/cloud-lite
+        ./alpine-cloud-images-lite2/scripts/build-rootfs.sh alpine-base.raw.tar.gz alpine-${_VERSION_SLUG}-lite.raw.tar.gz
+
+  # 2. Upload archive to Google Cloud Storage
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        gcloud storage cp /workspace/alpine-${_VERSION_SLUG}-lite.raw.tar.gz \
+          gs://${_GCS_BUCKET}/${_GCS_PATH}/${_ALPINE_VERSION}/alpine-${_VERSION_SLUG}-lite.raw.tar.gz
+
+  # 3. Register GCP compute image
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'gcloud'
+    args:
+      - 'compute'
+      - 'images'
+      - 'create'
+      - 'alpine-${_VERSION_SLUG}-uefi-lite-v5'
+      - '--source-uri'
+      - 'gs://${_GCS_BUCKET}/${_GCS_PATH}/${_ALPINE_VERSION}/alpine-${_VERSION_SLUG}-lite.raw.tar.gz'
+      - '--guest-os-features'
+      - 'UEFI_COMPATIBLE,GVNIC'
+      - '--family'
+      - 'alpine-lite'
+      - '--description'
+      - 'Ultra-low memory Alpine Lite GCP image with cloud-lite bootstrap, Dropbear, and zram'
+      - '--project'
+      - '${PROJECT_ID}'
+
+substitutions:
+  _ALPINE_VERSION: '3.24.1'
+  _ALPINE_BRANCH: '3.24'
+  _VERSION_SLUG: '3-24-1'
+  _GCS_BUCKET: '${PROJECT_ID}-ops'
+  _GCS_PATH: 'ops/alpine'
+  _SSH_AUTHORIZED_KEY: ''
+
+options:
+  machineType: 'E2_HIGHCPU_8'
+  logging: CLOUD_LOGGING_ONLY

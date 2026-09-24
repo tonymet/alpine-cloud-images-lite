@@ -1,0 +1,235 @@
+#!/bin/sh
+# setup-lite: Target rootfs provisioning script for alpine-lite variant
+# Run inside the build environment target filesystem ($TARGET) after upstream setup
+
+set -eu
+
+TARGET="${TARGET:-/mnt}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Source .env if present
+if [ -f "$SCRIPT_DIR/../.env" ]; then
+    . "$SCRIPT_DIR/../.env"
+elif [ -f "./.env" ]; then
+    . "./.env"
+fi
+
+einfo() {
+    echo "* $*"
+}
+
+einfo "Configuring alpine-lite low-memory optimizations..."
+
+# 1. BusyBox NTP configuration
+if [ -f "$TARGET/etc/conf.d/ntpd" ]; then
+    einfo "Configuring BusyBox ntpd for cloud metadata..."
+    case "${CLOUD:-}" in
+        gcp)
+            sed -i 's|NTPD_OPTS=.*|NTPD_OPTS="-N -p metadata.google.internal"|' "$TARGET/etc/conf.d/ntpd"
+            ;;
+        aws)
+            sed -i 's|NTPD_OPTS=.*|NTPD_OPTS="-N -p 169.254.169.123"|' "$TARGET/etc/conf.d/ntpd"
+            ;;
+        *)
+            sed -i 's|NTPD_OPTS=.*|NTPD_OPTS="-N -p pool.ntp.org"|' "$TARGET/etc/conf.d/ntpd"
+            ;;
+    esac
+fi
+
+# 2. Dropbear hostkey generation option
+if [ -d "$TARGET/etc/conf.d" ]; then
+    einfo "Configuring Dropbear options..."
+    echo 'DROPBEAR_OPTS="-R"' > "$TARGET/etc/conf.d/dropbear"
+fi
+
+# 3. ZRAM compressed swap (512 MB LZ4)
+if [ -d "$TARGET/etc/conf.d" ]; then
+    einfo "Configuring zram-init for compressed RAM swap..."
+    cat << 'EOF' > "$TARGET/etc/conf.d/zram-init"
+# zram settings for Alpine Lite
+load_on_start=yes
+unload_on_stop=yes
+num_devices=1
+
+type0=swap
+flag0=16383
+size0=512
+algo0=lz4
+labl0=zram_swap
+EOF
+fi
+
+# 4. Modprobe blacklist for headless cloud VMs
+einfo "Installing headless driver blacklist..."
+mkdir -p "$TARGET/etc/modprobe.d"
+cat << 'EOF' > "$TARGET/etc/modprobe.d/alpine-lite-blacklist.conf"
+# Blacklist unused display, GPU, DRM drivers for headless cloud VMs
+blacklist drm
+blacklist drm_kms_helper
+blacklist simpledrm
+blacklist drm_shmem_helper
+blacklist drm_sysfb_helper
+blacklist drm_client_lib
+blacklist drm_panel_orientation_quirks
+blacklist fb
+blacklist fb_sys_fops
+blacklist syscopyarea
+blacklist sysfillrect
+blacklist sysimgblt
+
+# Blacklist unused input and legacy mouse drivers
+blacklist psmouse
+blacklist mousedev
+
+# Blacklist unused USB and SMBus drivers
+blacklist usbcore
+blacklist usb_storage
+blacklist usb_common
+blacklist i2c_piix4
+blacklist i2c_smbus
+blacklist i2c_core
+
+# Blacklist unused VLAN / trunking modules
+blacklist 8021q
+blacklist mrp
+EOF
+
+# 5. Sysctl memory tuning
+einfo "Installing sysctl memory tuning..."
+mkdir -p "$TARGET/etc/sysctl.d"
+cat << 'EOF' > "$TARGET/etc/sysctl.d/99-alpine-lite.conf"
+# Alpine Lite kernel & memory optimizations
+vm.vfs_cache_pressure = 200
+vm.swappiness = 10
+vm.dirty_ratio = 10
+vm.dirty_background_ratio = 3
+EOF
+
+# 5b. Kernel boot parameter tuning: pti=off, mitigations=off
+einfo "Configuring kernel boot parameters for low memory..."
+# Driver modules: sd-mod, ext4 are universal.
+# gve is Google Virtual Ethernet.
+# hv_vmbus, hv_storvsc, hv_netvsc, hyperv_fb enable Hyper-V Generation 2 synthetic SCSI, network, and display.
+KERNEL_MODULES="sd-mod,usb-storage,ext4,gve,hv_vmbus,hv_storvsc,hv_netvsc,hyperv_fb"
+
+if [ -f "$TARGET/etc/default/grub" ]; then
+    sed -i -E 's|GRUB_CMDLINE_LINUX_DEFAULT="(.*)"|GRUB_CMDLINE_LINUX_DEFAULT="\1 mitigations=off pti=off console=tty1 console=ttyS0,115200n8"|' "$TARGET/etc/default/grub" 2>/dev/null || true
+fi
+if [ -f "$TARGET/boot/grub/grub.cfg" ]; then
+    sed -i "s|ro  modules=[^ ]*|ro mitigations=off pti=off console=tty1 console=ttyS0,115200n8 modules=${KERNEL_MODULES}|g" "$TARGET/boot/grub/grub.cfg" 2>/dev/null || true
+    sed -i "s|ro modules=[^ ]*|ro mitigations=off pti=off console=tty1 console=ttyS0,115200n8 modules=${KERNEL_MODULES}|g" "$TARGET/boot/grub/grub.cfg" 2>/dev/null || true
+fi
+if [ -f "$TARGET/etc/update-extlinux.conf" ]; then
+    sed -i 's|default_kernel_opts="\(.*\)"|default_kernel_opts="\1 mitigations=off pti=off console=tty1 console=ttyS0,115200n8"|' "$TARGET/etc/update-extlinux.conf" 2>/dev/null || true
+    sed -i "s|modules=\([^ ]*\)|modules=${KERNEL_MODULES}|" "$TARGET/etc/update-extlinux.conf" 2>/dev/null || true
+fi
+if [ -f "$TARGET/boot/extlinux.conf" ]; then
+    sed -i 's|APPEND \(.*\) console=ttyS0|APPEND \1 mitigations=off pti=off console=tty1 console=ttyS0|' "$TARGET/boot/extlinux.conf" 2>/dev/null || true
+    sed -i "s|modules=[^ ]*|modules=${KERNEL_MODULES}|g" "$TARGET/boot/extlinux.conf" 2>/dev/null || true
+fi
+
+# 6. Bounded tmpfs entries in /etc/fstab
+einfo "Configuring bounded tmpfs in fstab..."
+cat << 'EOF' >> "$TARGET/etc/fstab"
+# tmpfs bounds for Alpine Lite
+tmpfs   /dev/shm    tmpfs   defaults,nodev,nosuid,noexec,size=64M   0 0
+tmpfs   /run        tmpfs   mode=0755,nosuid,nodev,size=64M        0 0
+EOF
+
+# 7. In-kernel tiny-power-button configuration (replaces acpid)
+einfo "Configuring tiny-power-button module..."
+mkdir -p "$TARGET/etc/modprobe.d"
+cat << 'EOF' > "$TARGET/etc/modprobe.d/tiny-power-button.conf"
+blacklist button
+options tiny-power-button power_signal=12
+EOF
+
+mkdir -p "$TARGET/etc"
+touch "$TARGET/etc/modules"
+if ! grep -q "^tiny-power-button" "$TARGET/etc/modules" 2>/dev/null; then
+    echo "tiny-power-button" >> "$TARGET/etc/modules"
+fi
+
+# 8. Physical console tty1 & serial ttyS0 getty
+if [ -f "$TARGET/etc/inittab" ]; then
+    einfo "Ensuring tty1 and ttyS0 gettys are active for Hyper-V and cloud console..."
+    # Ensure tty1 is active for virtual console (Hyper-V / QEMU window)
+    sed -i -E 's|^#+(tty1::respawn:.*getty.*)|\1|' "$TARGET/etc/inittab" 2>/dev/null || true
+    # Disable unneeded virtual terminals tty2-tty6 to save memory
+    sed -i -E 's|^([^#].*getty.*tty[2-6].*)|#\1|' "$TARGET/etc/inittab" 2>/dev/null || true
+    # Ensure ttyS0 is enabled for serial console
+    sed -i -E 's|^#+(ttyS0::respawn:.*getty.*)|\1|' "$TARGET/etc/inittab" 2>/dev/null || true
+fi
+
+# 10. Network interfaces configuration (dual-stack IPv4/IPv6 / BusyBox udhcpc & udhcpc6)
+einfo "Configuring dual-stack network interfaces..."
+mkdir -p "$TARGET/usr/share/udhcpc"
+cat << 'EOF' > "$TARGET/usr/share/udhcpc/default6.script"
+#!/bin/sh
+# Dedicated DHCPv6 handler for BusyBox udhcpc6 on Alpine Linux
+
+case "$1" in
+    deconfig)
+        [ -n "$ipv6" ] && ip -6 addr del "$ipv6"/128 dev "$interface" 2>/dev/null || true
+        ;;
+    renew|bound)
+        if [ -n "$ipv6" ]; then
+            ip -6 addr add "$ipv6"/128 dev "$interface"
+        fi
+        if [ -n "$dns" ]; then
+            for server in $dns; do
+                grep -q "$server" /etc/resolv.conf 2>/dev/null || echo "nameserver $server" >> /etc/resolv.conf
+            done
+        fi
+        ;;
+esac
+exit 0
+EOF
+chmod 755 "$TARGET/usr/share/udhcpc/default6.script"
+
+mkdir -p "$TARGET/etc/network"
+cat << 'EOF' > "$TARGET/etc/network/interfaces"
+auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet dhcp
+    post-up udhcpc6 -R -b -p /var/run/udhcpc6.eth0.pid -i eth0 -s /usr/share/udhcpc/default6.script
+EOF
+
+# 11. Provision cloud-lite multi-cloud metadata bootstrap service
+einfo "Installing cloud-lite service..."
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -f "$SCRIPT_DIR/cloud-lite" ]; then
+    cp "$SCRIPT_DIR/cloud-lite" "$TARGET/etc/init.d/cloud-lite"
+elif [ -f "/tmp/cloud-lite" ]; then
+    cp "/tmp/cloud-lite" "$TARGET/etc/init.d/cloud-lite"
+fi
+
+if [ -f "$TARGET/etc/init.d/cloud-lite" ]; then
+    chmod 755 "$TARGET/etc/init.d/cloud-lite"
+    chroot "$TARGET" rc-update add cloud-lite default 2>/dev/null || true
+    einfo "cloud-lite installed and enabled in default runlevel."
+fi
+
+# 12. Provision optional SSH key for testing (root and alpine)
+SSH_AUTHORIZED_KEY="${SSH_AUTHORIZED_KEY:-}"
+if [ -n "$SSH_AUTHORIZED_KEY" ]; then
+    einfo "Installing authorized SSH key for root user..."
+    mkdir -p "$TARGET/root/.ssh"
+    chmod 700 "$TARGET/root/.ssh"
+    echo "$SSH_AUTHORIZED_KEY" >> "$TARGET/root/.ssh/authorized_keys"
+    chmod 600 "$TARGET/root/.ssh/authorized_keys"
+
+    if [ -d "$TARGET/home/alpine" ]; then
+        einfo "Installing authorized SSH key for alpine user..."
+        mkdir -p "$TARGET/home/alpine/.ssh"
+        chmod 700 "$TARGET/home/alpine/.ssh"
+        echo "$SSH_AUTHORIZED_KEY" >> "$TARGET/home/alpine/.ssh/authorized_keys"
+        chmod 600 "$TARGET/home/alpine/.ssh/authorized_keys"
+        chown -R 1000:1000 "$TARGET/home/alpine/.ssh" 2>/dev/null || true
+    fi
+fi
+
+einfo "alpine-lite setup completed successfully."
+

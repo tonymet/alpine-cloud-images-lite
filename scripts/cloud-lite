@@ -1,0 +1,200 @@
+#!/sbin/openrc-run
+# /etc/init.d/cloud-lite
+# Lightweight multi-cloud instance bootstrap service for Alpine Lite.
+# Replaces tiny-cloud without OpenSSH or Python/YAML dependencies.
+# Supports GCP, AWS EC2, and Azure.
+# Performs:
+#   1. Online root disk & ext4 partition auto-expansion
+#   2. Dynamic hypervisor / cloud detection (DMI)
+#   3. Hostname configuration from cloud IMDS
+#   4. Dropbear / SSH authorized_keys provisioning for users from cloud IMDS
+
+description="Lightweight Multi-Cloud instance bootstrap (GCP, AWS, Azure)"
+
+depend() {
+    after root
+    need networking
+    before dropbear sshd
+}
+
+detect_cloud() {
+    local vendor product
+    vendor=$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || true)
+    product=$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)
+
+    case "$vendor $product" in
+        *[Gg]oogle*)               echo "gcp" ;;
+        *[Aa]mazon*|*[Ee][Cc]2*)   echo "aws" ;;
+        *[Mm]icrosoft*)            echo "azure" ;;
+        *)                         echo "unknown" ;;
+    esac
+}
+
+expand_root() {
+    local dev filesystem partition volume
+    dev=$(awk '$2 == "/" {print $1}' /proc/mounts 2>/dev/null)
+    filesystem=$(awk '$2 == "/" {print $3}' /proc/mounts 2>/dev/null)
+    partition=$(cat "/sys/class/block/${dev#/dev/}/partition" 2>/dev/null || true)
+
+    [ "$filesystem" = "ext4" ] || return 0
+
+    if [ -n "$partition" ] && command -v sfdisk >/dev/null 2>&1; then
+        volume=$(readlink -f "/sys/class/block/${dev#/dev/}/.." 2>/dev/null || true)
+        volume="/dev/${volume##*/}"
+        if [ -b "$volume" ]; then
+            echo ", +" | sfdisk -q --no-reread -N "$partition" "$volume" 2>/dev/null || true
+            command -v partx >/dev/null 2>&1 && partx -u "$volume" 2>/dev/null || true
+        fi
+    fi
+
+    if command -v resize2fs >/dev/null 2>&1 && [ -b "$dev" ]; then
+        resize2fs "$dev" >/dev/null 2>&1 || true
+    fi
+}
+
+fetch_aws_token() {
+    wget -q -T 1 --header "X-aws-ec2-metadata-token-ttl-seconds: 60" \
+        --method=PUT -O - http://169.254.169.254/latest/api/token 2>/dev/null || true
+}
+
+fetch_hostname() {
+    local cloud="$1"
+    case "$cloud" in
+        gcp)
+            wget -q -T 2 -O - --header "Metadata-Flavor: Google" \
+                "http://169.254.169.254/computeMetadata/v1/instance/hostname" 2>/dev/null || true
+            ;;
+        aws)
+            local token
+            token=$(fetch_aws_token)
+            wget -q -T 2 ${token:+--header "X-aws-ec2-metadata-token: $token"} \
+                -O - "http://169.254.169.254/latest/meta-data/local-hostname" 2>/dev/null || true
+            ;;
+        azure)
+            wget -q -T 2 -O - --header "Metadata: true" \
+                "http://169.254.169.254/metadata/instance/compute/name?api-version=2021-02-01&format=text" 2>/dev/null || true
+            ;;
+    esac
+}
+
+fetch_ssh_keys() {
+    local cloud="$1"
+    case "$cloud" in
+        gcp)
+            # GCP keys are formatted as: <username>:<key-material>
+            for attr in "instance/attributes/ssh-keys" "project/attributes/ssh-keys"; do
+                wget -q -T 2 -O - --header "Metadata-Flavor: Google" \
+                    "http://169.254.169.254/computeMetadata/v1/$attr" 2>/dev/null || true
+                echo
+            done | sort -u
+            ;;
+        aws)
+            local token key
+            token=$(fetch_aws_token)
+            key=$(wget -q -T 2 ${token:+--header "X-aws-ec2-metadata-token: $token"} \
+                -O - "http://169.254.169.254/latest/meta-data/public-keys/0/openssh-key" 2>/dev/null || true)
+            # Assign AWS public key to default alpine user
+            [ -n "$key" ] && echo "alpine:$key"
+            ;;
+        azure)
+            # Standard Azure IMDS key query
+            local key
+            key=$(wget -q -T 2 -O - --header "Metadata: true" \
+                "http://169.254.169.254/metadata/instance/compute/publicKeys/0/keyData?api-version=2021-02-01&format=text" 2>/dev/null || true)
+            [ -n "$key" ] && echo "alpine:$key"
+            ;;
+    esac
+}
+
+set_hostname() {
+    local cloud="$1" fqdn host
+    fqdn=$(fetch_hostname "$cloud")
+    [ -n "$fqdn" ] || return 0
+
+    host="${fqdn%%.*}"
+    [ -n "$host" ] || host="$fqdn"
+
+    echo "$host" > /etc/hostname
+    hostname -F /etc/hostname 2>/dev/null || hostname "$host" 2>/dev/null || true
+
+    if ! grep -q "$host" /etc/hosts 2>/dev/null; then
+        echo -e "127.0.1.1\t$fqdn $host" >> /etc/hosts
+    fi
+}
+
+provision_ssh_keys() {
+    local cloud="$1" keys line user key pwent ssh_dir group
+
+    keys=$(fetch_ssh_keys "$cloud")
+    [ -n "$keys" ] || return 0
+
+    echo "$keys" | while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        user=$(echo "$line" | cut -d: -f1)
+        key=$(echo "$line" | cut -d: -f2-)
+
+        [ -n "$user" ] && [ -n "$key" ] || continue
+
+        # Auto-create user if missing (defaulting to alpine or metadata user)
+        if ! pwent="$(getent passwd "$user" 2>/dev/null)"; then
+            adduser -D -s /bin/sh "$user" 2>/dev/null || true
+            addgroup "$user" wheel 2>/dev/null || true
+            pwent="$(getent passwd "$user" 2>/dev/null)" || continue
+        fi
+
+        group=$(echo "$pwent" | cut -d: -f4)
+        ssh_dir="$(echo "$pwent" | cut -d: -f6)/.ssh"
+
+        mkdir -p "$ssh_dir"
+        chmod 700 "$ssh_dir"
+        grep -q -F "$key" "$ssh_dir/authorized_keys" 2>/dev/null || echo "$key" >> "$ssh_dir/authorized_keys"
+        chmod 600 "$ssh_dir/authorized_keys"
+        chown -R "$user:$group" "$ssh_dir" 2>/dev/null || true
+    done
+}
+
+wait_for_metadata() {
+    local cloud="$1" retries=10
+    while [ "$retries" -gt 0 ]; do
+        case "$cloud" in
+            gcp)
+                if wget -q -T 1 -O /dev/null --header "Metadata-Flavor: Google" "http://169.254.169.254/computeMetadata/v1/instance/id" 2>/dev/null; then
+                    return 0
+                fi
+                ;;
+            aws)
+                if wget -q -T 1 -O /dev/null "http://169.254.169.254/latest/meta-data/" 2>/dev/null; then
+                    return 0
+                fi
+                ;;
+            azure)
+                if wget -q -T 1 -O /dev/null --header "Metadata: true" "http://169.254.169.254/metadata/instance?api-version=2021-02-01" 2>/dev/null; then
+                    return 0
+                fi
+                ;;
+            *)
+                return 0
+                ;;
+        esac
+        sleep 0.5
+        retries=$((retries - 1))
+    done
+}
+
+start() {
+    local cloud
+    cloud=$(detect_cloud)
+    ebegin "Starting cloud-lite bootstrap [detected: $cloud]"
+    
+    # 1. Expand root filesystem if on first boot or resized disk
+    expand_root
+
+    # 2. Wait up to 5s for cloud metadata endpoint reachability
+    wait_for_metadata "$cloud"
+
+    # 3. Configure hostname and SSH authorized keys
+    set_hostname "$cloud"
+    provision_ssh_keys "$cloud"
+
+    eend 0
+}

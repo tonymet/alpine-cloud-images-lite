@@ -1,0 +1,12 @@
+# Secrets and local environment overrides
+.env
+.env.local
+.env.*.local
+
+# Build artifacts and temp dirs
+build-work/
+output/
+*.raw
+*.raw.tar.gz
+*.vhdx
+*.qcow2
